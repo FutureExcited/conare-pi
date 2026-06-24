@@ -11,7 +11,7 @@
     "extensions": ["./extension/conare.ts"]
   },
   "files": [
-    "extension",
+    "extension/conare.ts",
     "README.md",
     "LICENSE"
   ],
