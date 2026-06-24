@@ -1,0 +1,51 @@
+{
+  "name": "@conare/pi",
+  "version": "0.1.0",
+  "description": "Persistent, cross-session memory for the Pi coding agent — powered by Conare.",
+  "type": "module",
+  "main": "extension/conare.ts",
+  "exports": {
+    ".": "./extension/conare.ts"
+  },
+  "pi": {
+    "extensions": ["./extension/conare.ts"]
+  },
+  "files": [
+    "extension",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.1",
+    "typescript": "^6.0.3"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "conare",
+    "memory",
+    "ai",
+    "coding-agent",
+    "extension"
+  ],
+  "homepage": "https://conare.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FutureExcited/conare-pi"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
