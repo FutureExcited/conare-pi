@@ -40,10 +40,10 @@ test("tool params mirror the MCP server schemas", () => {
   const { api, tools } = mockPi();
   conare(api as any);
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
-  // recall: query + the optional author/deep richer params.
-  expect(Object.keys(byName.recall.parameters.properties).sort()).toEqual(["author", "deep", "prompt", "query"]);
+  // recall: query + the optional author/shallow richer params.
+  expect(Object.keys(byName.recall.parameters.properties).sort()).toEqual(["author", "prompt", "query", "shallow"]);
   // search: adds time-range after/before.
-  expect(Object.keys(byName.search.parameters.properties).sort()).toEqual(["after", "author", "before", "deep", "prompt", "query"]);
+  expect(Object.keys(byName.search.parameters.properties).sort()).toEqual(["after", "author", "before", "prompt", "query", "shallow"]);
   expect(Object.keys(byName.save.parameters.properties)).toContain("content");
   expect(Object.keys(byName.forget.parameters.properties)).toContain("memoryId");
 });
@@ -110,7 +110,7 @@ test("execute THROWS after retry on persistent 5xx (Pi sets isError)", async () 
   expect(calls).toBe(2); // tried once, retried once, then threw
 });
 
-test("retries ONCE on a transient Durable-Object reset, then succeeds", async () => {
+test("retries ONCE on a transient server-side reset, then succeeds", async () => {
   // First call: a DO-reset RPC error (exactly what prod throws after a big
   // write). Second call: success. The model should never see the blip.
   let calls = 0;

@@ -71,8 +71,7 @@ function cap(text: string): string {
 /**
  * Call a Conare MCP tool over plain HTTP JSON-RPC (the MCP `tools/call` method).
  * Returns the text content. Retries ONCE on a transient error (5xx, network
- * blip, or a Cloudflare Durable-Object reset — common right after a large write
- * while the DO is migrating). THROWS only if the retry also fails, so Pi sets
+ * blip, or a server-side reset). THROWS only if the retry also fails, so Pi sets
  * `isError: true` and the model knows. A missing key is NOT an error (nothing
  * to retry) — it returns guidance text instead.
  */
@@ -89,17 +88,17 @@ async function callConareTool(
     return await callOnce(name, args, key, signal);
   } catch (e) {
     if (signal?.aborted || !isTransient(e)) throw e;
-    await new Promise((r) => setTimeout(r, 400)); // brief backoff; DO usually recovers fast
+    await new Promise((r) => setTimeout(r, 400)); // brief backoff; server usually recovers fast
     return await callOnce(name, args, key, signal);
   }
 }
 
-/** A Durable Object reset / 5xx / network blip is worth one retry. */
+/** A server-side reset / 5xx / network blip is worth one retry. */
 function isTransient(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return (
     /HTTP 5\d\d/.test(msg) ||           // server-side 5xx
-    /Durable Object|reset|Internal error/i.test(msg) || // CF DO migration/eviction
+    /reset|Internal error/i.test(msg) || // transient server-side reset
     /network|fetch failed|ECONNRESET|ETIMEDOUT/i.test(msg)
   );
 }
@@ -191,11 +190,14 @@ export default function conare(pi: ExtensionAPI): void {
     name: "recall",
     label: "Recall",
     description:
-      "Call recall ONCE at the start of a task to load prior context from Conare " +
-      "memory — past sessions, decisions, and preferences. Returns an LLM-" +
-      "synthesized brief (noise removed, details preserved). For mid-task " +
-      "lookups use search instead, not a second recall. Pass prompt to steer " +
-      "what the synthesis emphasizes.",
+      "Load this developer's context for the task at hand — what they've built, " +
+      "decided, tried and rejected, and why. Call it ONCE when a session starts " +
+      "or turns to real work, before exploring a codebase or asking the user to " +
+      "re-explain something they've already worked through. It synthesizes " +
+      "across the entire corpus, so it answers open questions ('how did X " +
+      "evolve', 'why is it built this way') that no single lookup can. For " +
+      "narrow mid-task lookups use search instead, not a second recall. Pass " +
+      "prompt to steer what the synthesis emphasizes.",
     parameters: Type.Object({
       query: Type.String({
         description:
@@ -212,8 +214,10 @@ export default function conare(pi: ExtensionAPI): void {
           "TEAM ONLY. Load context from ONE teammate — their name, email, or " +
           "handle, or 'me' for your own. Omit to merge yourself + all teammates.",
       })),
-      deep: Type.Optional(Type.Boolean({
-        description: "Default true (LLM synthesis). Set false only for exact-string raw lookups.",
+      shallow: Type.Optional(Type.Boolean({
+        description:
+          "Return raw matching memories instead of a synthesized answer. Only " +
+          "for exact-string lookups where you want the unprocessed list.",
       })),
     }),
     async execute(_id, params, signal) {
@@ -226,10 +230,14 @@ export default function conare(pi: ExtensionAPI): void {
     name: "search",
     label: "Search",
     description:
-      "Call search to look up a specific topic, decision, person, file, or " +
-      "reference in Conare memory mid-task — the right tool any time you need a " +
-      "detail AFTER the initial recall (never call recall twice). Returns an " +
-      "LLM-synthesized answer. Pass prompt to steer synthesis.",
+      "Answer a question from the developer's history — it reasons over what it " +
+      "retrieves rather than returning a match list, so analytical questions " +
+      "work as well as lookups: what was decided and why, how something is " +
+      "wired, whether an approach was already tried and rejected, what a person " +
+      "said, how something changed over time. Reach for it whenever you need " +
+      "project context mid-task, before grepping a repo or asking the user to " +
+      "re-explain (use it AFTER the initial recall — never call recall twice). " +
+      "Returns dated evidence with sources. Pass prompt to steer synthesis.",
     parameters: Type.Object({
       query: Type.String({
         description:
@@ -250,8 +258,10 @@ export default function conare(pi: ExtensionAPI): void {
           "TEAM ONLY. Restrict to ONE teammate's memories — name, email, or " +
           "handle, or 'me'. Omit to search across everyone (results stay labeled).",
       })),
-      deep: Type.Optional(Type.Boolean({
-        description: "Default true (LLM synthesis). Set false only for exact-string raw lookups.",
+      shallow: Type.Optional(Type.Boolean({
+        description:
+          "Return raw matching memories instead of a synthesized answer. Only " +
+          "for exact-string lookups where you want the unprocessed list.",
       })),
     }),
     async execute(_id, params, signal) {
