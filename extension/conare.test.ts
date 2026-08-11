@@ -48,14 +48,46 @@ test("tool params mirror the MCP server schemas", () => {
   expect(Object.keys(byName.forget.parameters.properties)).toContain("memoryId");
 });
 
-test("tools-only: registers NO automatic recall hooks (no startup/first-message stall)", () => {
+test("registers the Living Brief hooks (session_start prefetch + first-message inject)", () => {
   const { api, events } = mockPi();
   conare(api as any);
-  // By design there is no automatic recall — no session_start, no
-  // before_agent_start. Memory is reached only when the model calls a tool, so
-  // nothing Conare does is ever on Pi's startup or first-message critical path.
-  expect(events.session_start).toBeUndefined();
-  expect(events.before_agent_start).toBeUndefined();
+  // The SessionStart contract: prefetch at session_start (non-blocking),
+  // inject on before_agent_start. Live LLM synthesis stays off the critical
+  // path — the brief is a precomputed control-plane read.
+  expect(typeof events.session_start).toBe("function");
+  expect(typeof events.before_agent_start).toBe("function");
+});
+
+test("first-message inject degrades to NOTHING without a key (no stall, no error)", async () => {
+  const prevBase = process.env.CONARE_HOME;
+  const prevKey = process.env.CONARE_API_KEY;
+  process.env.CONARE_HOME = "/conare-test-no-such-home";
+  process.env.CONARE_API_KEY = "";
+  try {
+    const { api, events } = mockPi();
+    conare(api as any);
+    await events.session_start!({ reason: "startup" });
+    const start = Date.now();
+    const result = await events.before_agent_start!({});
+    // No key → prefetch resolves undefined immediately; nothing injected and
+    // the first message is not delayed (well under the 2s budget).
+    expect(result).toBeUndefined();
+    expect(Date.now() - start).toBeLessThan(500);
+    // Second message: never injects again.
+    expect(await events.before_agent_start!({})).toBeUndefined();
+  } finally {
+    if (prevBase === undefined) delete process.env.CONARE_HOME; else process.env.CONARE_HOME = prevBase;
+    if (prevKey === undefined) delete process.env.CONARE_API_KEY; else process.env.CONARE_API_KEY = prevKey;
+  }
+});
+
+test("resume/fork/reload sessions do NOT re-inject the brief", async () => {
+  const { api, events } = mockPi();
+  conare(api as any);
+  for (const reason of ["resume", "fork", "reload"]) {
+    await events.session_start!({ reason });
+    expect(await events.before_agent_start!({})).toBeUndefined();
+  }
 });
 
 test("execute returns Pi tool-result shape + config guidance with no key (graceful)", async () => {

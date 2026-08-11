@@ -11,7 +11,9 @@ It's the same memory engine Conare already wires into Claude Code, Codex, Cursor
 - **`recall`** — load relevant prior context for the task at hand.
 - **`search`** — look up a specific past decision, bug, or conversation.
 - **`save`** — persist a durable fact or preference for future sessions.
-All three are registered as **native Pi tools** (no MCP proxy, no per-tool token tax) that the model calls when memory is relevant. There's **no automatic recall** — so nothing Conare does is ever on Pi's startup or first-message critical path. (Auto-injecting pre-prepared context is on the roadmap, once it's fast enough to be invisible.)
+All three are registered as **native Pi tools** (no MCP proxy, no per-tool token tax) that the model calls when memory is relevant.
+
+On top of the tools, each fresh session starts with your **Living Brief**: a precomputed current-state snapshot of your work (consolidated server-side every 24h), prefetched at session start and injected on your first message. It's a pure control-plane read — no LLM on the critical path — so startup stays instant and the first message waits at most 2s (usually 0).
 
 ## Install
 
@@ -44,7 +46,7 @@ This is a [Pi package](https://pi.dev/docs/latest/packages) — install it with 
 
 The extension talks to Conare's memory engine over its MCP HTTP endpoint (`https://conare.ai/mcp`) using your API key — built-in `fetch`, JSON-RPC `tools/call`, handles both JSON and SSE responses.
 
-The `recall`/`search`/`save` tools call the corresponding memory operations when the model invokes them. There is **no background recall** on a lifecycle hook: any automatic recall today would put a live synthesis round-trip on the critical path and slow your first message. Tools-only keeps Pi fast and lets the model decide when memory is worth fetching. (A future version may auto-inject a *pre-prepared* context blob — fast enough to be invisible — but live synth on every session is the wrong tradeoff.)
+The `recall`/`search`/`save` tools call the corresponding memory operations when the model invokes them. There is **no live-synthesis recall** on a lifecycle hook — that would put a multi-second LLM round-trip on the critical path. What IS injected automatically is the **precomputed Living Brief** (`GET /api/hook/brief`, the same SessionStart contract Conare's Claude Code and Codex hooks use): prefetched non-blocking at `session_start`, injected on the first message under a hard 2s budget, silently skipped on any failure. Tool descriptions self-update too — the server's per-tenant `tools/list` (live corpus stats) is cached to disk each session and used at the next startup.
 
 It's one small file (its only runtime dependency is TypeBox, Pi's own schema library) — read it, fork it, audit it.
 

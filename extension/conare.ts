@@ -9,10 +9,18 @@
  *
  * What it does
  *   • registerTool → `recall`, `search`, `save`, `forget` become first-class
- *                    tools the model can call when memory is relevant. No
- *                    automatic recall — that would put a live synthesis round-
- *                    trip on the critical path (slow first message). Tools-only
- *                    keeps Pi fast; the model decides when to reach for memory.
+ *                    tools the model can call when memory is relevant.
+ *   • Living Brief → on session start we PREFETCH the precomputed brief
+ *                    (`GET /api/hook/brief` — pure control-plane read, no LLM,
+ *                    p95 <300ms) plus the server's evidence-handling
+ *                    instructions, and inject both on the FIRST message. Same
+ *                    SessionStart contract the Claude Code and Codex hooks
+ *                    use. Startup never blocks; the first message waits at
+ *                    most 2s (usually 0 — prefetch wins the race).
+ *   • tools/list cache → the server's per-tenant tool descriptions (they
+ *                    carry live corpus stats) are cached to disk each session
+ *                    and used at the NEXT startup, so descriptions track the
+ *                    server with zero critical-path network.
  *
  * Setup
  *   1. pi install npm:@conare/pi          (or drop this file in ~/.pi/agent/extensions/)
@@ -52,6 +60,8 @@ function apiKey(): string {
   } catch { /* no Conare CLI config — fall through to empty */ }
   return "";
 }
+
+const confDir = () => join(process.env.CONARE_HOME ?? homedir(), ".conare");
 
 /**
  * Cap tool output so a large recall never floods the LLM context. Pi's own
@@ -179,7 +189,140 @@ function toolText(text: string) {
   return { content: [{ type: "text" as const, text: text || "(no result)" }], details: {} };
 }
 
+// ── Living Brief + server instructions (SessionStart contract) ────────────
+
+const PREFETCH_TIMEOUT_MS = 2_500; // per-fetch abort (prefetch runs off the critical path)
+const INJECT_BUDGET_MS = 2_000;    // hard cap the first message ever waits (hook contract)
+
+/**
+ * Fetch the precomputed Living Brief + the MCP server instructions in
+ * parallel. Both are best-effort: any failure (no key, 204, network, auth)
+ * resolves to undefined — injection silently degrades to nothing, a session
+ * must never break or stall because memory was unreachable.
+ */
+async function prefetchContext(): Promise<string | undefined> {
+  const key = apiKey();
+  if (!key) return undefined;
+
+  const [brief, instructions] = await Promise.all([
+    (async () => {
+      try {
+        const res = await fetch(`${conareUrl()}/api/hook/brief?client=pi`, {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(PREFETCH_TIMEOUT_MS),
+        });
+        if (res.status !== 200) return undefined; // 204 = no brief yet (server enqueues one)
+        const text = (await res.text()).trim();
+        return text || undefined;
+      } catch { return undefined; }
+    })(),
+    (async () => {
+      try {
+        const res = await fetch(`${conareUrl()}/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            Authorization: `Bearer ${key}`,
+          },
+          signal: AbortSignal.timeout(PREFETCH_TIMEOUT_MS),
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: 1, method: "initialize",
+            params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "conare-pi", version: "0.3.0" } },
+          }),
+        });
+        if (!res.ok) return undefined;
+        const payload = await readJsonRpc(res) as { result?: { instructions?: string } } | null;
+        const text = payload?.result?.instructions?.trim();
+        return text || undefined;
+      } catch { return undefined; }
+    })(),
+  ]);
+
+  if (!brief && !instructions) return undefined;
+  return [instructions, brief].filter(Boolean).join("\n\n");
+}
+
+// ── tools/list description cache ─────────────────────────────────────
+// The server's tools/list is per-tenant: recall/search descriptions carry live
+// corpus stats ("N memories across claude-chats, github…") — the signal that
+// stops a model from grepping a repo when memory reaches further. Tools must
+// register synchronously at extension load, so we read LAST session's cached
+// descriptions from disk (sync, local, ~0ms) and refresh the cache in the
+// background each session. One session of lag, zero critical-path network.
+
+const TOOLS_CACHE_FILE = "pi-tools-cache.json";
+
+function cachedDescription(name: string): string | undefined {
+  try {
+    const cache = JSON.parse(readFileSync(join(confDir(), TOOLS_CACHE_FILE), "utf-8"));
+    const desc = cache?.tools?.[name];
+    return typeof desc === "string" && desc.length > 0 ? desc : undefined;
+  } catch { return undefined; }
+}
+
+async function refreshToolsCache(): Promise<void> {
+  const key = apiKey();
+  if (!key) return;
+  try {
+    const res = await fetch(`${conareUrl()}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        Authorization: `Bearer ${key}`,
+      },
+      signal: AbortSignal.timeout(PREFETCH_TIMEOUT_MS),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    if (!res.ok) return;
+    const payload = await readJsonRpc(res) as {
+      result?: { tools?: Array<{ name?: string; description?: string }> };
+    } | null;
+    const tools: Record<string, string> = {};
+    for (const t of payload?.result?.tools ?? []) {
+      if (t?.name && typeof t.description === "string") tools[t.name] = t.description;
+    }
+    if (Object.keys(tools).length === 0) return;
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(confDir(), { recursive: true });
+    writeFileSync(join(confDir(), TOOLS_CACHE_FILE), JSON.stringify({ fetchedAt: Date.now(), tools }));
+  } catch { /* cache refresh is never worth an error */ }
+}
+
 export default function conare(pi: ExtensionAPI): void {
+  // ── Living Brief injection (SessionStart contract) ─────────────────────
+  // Prefetch starts at session_start (non-blocking); the FIRST message of a
+  // fresh session awaits it under a hard 2s budget and injects the result as a
+  // persisted message — the Pi equivalent of Claude Code's SessionStart
+  // additionalContext. Resumed/forked/reloaded sessions already carry the
+  // injected message in their history, so only "startup" and "new" inject.
+  let prefetch: Promise<string | undefined> | null = null;
+  let shouldInject = false;
+
+  pi.on("session_start", async (event) => {
+    shouldInject = event.reason === "startup" || event.reason === "new";
+    prefetch = shouldInject ? prefetchContext() : null;
+    void refreshToolsCache(); // keep NEXT startup's tool descriptions current
+  });
+
+  pi.on("before_agent_start", async () => {
+    if (!shouldInject || !prefetch) return;
+    shouldInject = false; // first message only
+    const context = await Promise.race([
+      prefetch,
+      new Promise<undefined>((r) => setTimeout(() => r(undefined), INJECT_BUDGET_MS)),
+    ]);
+    if (!context) return;
+    return {
+      message: {
+        customType: "conare-context",
+        content: cap(context),
+        display: false,
+      },
+    };
+  });
+
   // ── Native tools ──────────────────────────────────────────────────────────
   // These mirror the Conare MCP server's tool set (recall/search/save/forget)
   // and parameters 1:1, so the model behaves the same in Pi as in every other
@@ -189,7 +332,7 @@ export default function conare(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "recall",
     label: "Recall",
-    description:
+    description: cachedDescription("recall") ??
       "Load this developer's context for the task at hand — what they've built, " +
       "decided, tried and rejected, and why. Call it ONCE when a session starts " +
       "or turns to real work, before exploring a codebase or asking the user to " +
@@ -229,7 +372,7 @@ export default function conare(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "search",
     label: "Search",
-    description:
+    description: cachedDescription("search") ??
       "Answer a question from the developer's history — it reasons over what it " +
       "retrieves rather than returning a match list, so analytical questions " +
       "work as well as lookups: what was decided and why, how something is " +
@@ -301,14 +444,13 @@ export default function conare(pi: ExtensionAPI): void {
     },
   });
 
-  // ── No automatic recall (by design) ───────────────────────────────────────
-  // We deliberately do NOT recall on session_start or before_agent_start: any
-  // automatic recall today means a live LLM-synthesis round-trip (seconds) on
-  // the critical path — it blocks either startup or the first message, which is
-  // exactly the latency users hate. Instead we give the model the recall/search
-  // tools and let it pull memory when it's actually relevant.
-  //
-  // Future: auto-inject a *pre-prepared* context blob (precomputed server-side,
-  // ~1s) on the first message. That's fast enough to be invisible; live synth
-  // is not. Until that exists, tools-only is the right call.
+  // ── No automatic LIVE recall (by design) ───────────────────────────────────────
+  // We still never run a live LLM-synthesis recall on the critical path — that
+  // costs seconds and blocks either startup or the first message. What we DO
+  // inject (above) is the *precomputed* Living Brief: materialized server-side
+  // every 24h, served as a plain-text control-plane read. That is exactly the
+  // "pre-prepared context blob" this file's old FUTURE note asked for — fast
+  // enough to be invisible. The brief's own footer tells the model to still
+  // call `recall` once it knows what the session is about (the brief is a
+  // ~8KB current-state snapshot of a much larger corpus, not a substitute).
 }
