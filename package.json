@@ -1,6 +1,6 @@
 {
   "name": "@conare/pi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Persistent, cross-session memory for the Pi coding agent — powered by Conare.",
   "type": "module",
   "main": "extension/conare.ts",
